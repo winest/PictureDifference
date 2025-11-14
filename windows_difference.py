@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Foreground-window screenshot diff highlighter with global hotkeys on Windows.
-
-Updates:
-- Default RECT_MODE set to "frame" (uses DWM extended frame bounds).
-- Fix debug preview: cache last left/right halves and render immediately when toggled on.
-
-Features:
-- Toggle overlay hotkey: capture current foreground window, split left/right,
-  compute differences, draw polygons on a transparent overlay; press again to clear.
-- Debug toggle hotkey: show/hide left and right captured halves.
+This version adds BLINKING border-only (no fill) polygons with configurable
+high-contrast or rainbow colors to make differences easier to see.
 
 Hotkeys (configurable at top):
 - Ctrl+Shift+D: Toggle overlay (show/clear).
@@ -41,40 +34,73 @@ from pynput import keyboard
 
 # ===========================
 # Configuration Parameters
+# (All user-tunable settings)
 # ===========================
+
+# --- Hotkeys ---
 HOTKEY_TOGGLE_OVERLAY: str = "<ctrl>+<shift>+d"   # Toggle overlay show/clear
 HOTKEY_DEBUG_TOGGLE: str = "<ctrl>+<shift>+b"     # Toggle debug preview windows
 HOTKEY_QUIT: str = "<ctrl>+<shift>+q"             # Quit application
 
-# Default to "frame" mode as per user's environment feedback
-RECT_MODE: str = "window"  # one of: "client", "frame", "window"
+# --- Target rectangle mode ---
+# One of: "client" (client area), "frame" (DWM extended frame bounds), "window" (GetWindowRect)
+# "frame" usually aligns better with what you see on screen.
+RECT_MODE: str = "window"
 
-DIFF_TOLERANCE: int = 25                    # Threshold for difference (0-255)
-MIN_CONTOUR_AREA: int = 150                 # Minimum area to keep a contour
-MORPH_KERNEL_SIZE: int = 3                  # Morphology kernel size for noise cleanup
-APPROX_POLY_EPSILON_RATIO: float = 0.01     # Polygon approximation epsilon ratio
+# --- Diff thresholds & cleanup ---
+DIFF_TOLERANCE: int = 15          # Threshold on absdiff grayscale (0-255). Higher = fewer differences.
+MIN_CONTOUR_AREA: int = 120       # Minimal contour area to keep.
+MORPH_KERNEL_SIZE: int = 3        # Morphology kernel size for noise cleanup.
+APPROX_POLY_EPSILON_RATIO: float = 0.01  # Polygon approximation epsilon ratio (fraction of perimeter).
 
-# Overlay colors (BGR for OpenCV)
-POLYGON_FILL_COLOR_BGR: Tuple[int, int, int] = (255, 0, 255)   # Magenta fill
-POLYGON_BORDER_COLOR_BGR: Tuple[int, int, int] = (0, 255, 255) # Yellow border
-POLYGON_BORDER_THICKNESS: int = 6
-
-# Transparent overlay background key
-TRANSPARENT_KEY_RGB: Tuple[int, int, int] = (0, 255, 0)  # Pure green used as transparency key
-TRANSPARENT_KEY_HEX: str = "#00FF00"
-
-# Window size guard
+# --- Window size guard (avoid tiny accidental captures) ---
 MIN_WINDOW_WIDTH: int = 100
 MIN_WINDOW_HEIGHT: int = 80
+
+# --- Overlay visualization (border only; do not fill) ---
+BORDER_THICKNESS: int = 3         # Thickness of the polygon outline.
+DRAW_FILL: bool = False           # Keep False to only draw border/skeleton.
+
+# --- Blink/animation settings ---
+# BLINK_MODE:
+#   "two_color" -> alternate between BLINK_COLORS_BGR
+#   "rainbow"   -> cycle through RAINBOW_COLORS_BGR
+#   "off"       -> draw once (no blinking)
+BLINK_MODE: str = "rainbow"
+
+# Interval in milliseconds between frames (lower = faster blink).
+BLINK_INTERVAL_MS: int = 80
+
+# High-contrast pair for "two_color" mode (BGR in OpenCV)
+# Default: Yellow <-> Magenta which pops well on most backgrounds.
+BLINK_COLORS_BGR: List[Tuple[int, int, int]] = [
+    (0, 255, 255),   # Yellow
+    (255, 0, 255),   # Magenta
+]
+
+# Rainbow palette for "rainbow" mode (BGR in OpenCV)
+RAINBOW_COLORS_BGR: List[Tuple[int, int, int]] = [
+    (0, 0, 255),     # Red
+    (0, 127, 255),   # Orange
+    (0, 255, 255),   # Yellow
+    (0, 255, 0),     # Green
+    (255, 127, 0),   # Sky blue
+    (255, 0, 0),     # Blue
+    (255, 0, 127),   # Purple-ish
+]
+
+# --- Transparent overlay background key ---
+# Pure green works well as a colorkey on Windows.
+TRANSPARENT_KEY_RGB: Tuple[int, int, int] = (0, 254, 0)
+TRANSPARENT_KEY_HEX: str = "#00FE00"
 
 
 # ===========================
 # DPI Awareness
 # ===========================
+
 def set_dpi_awareness() -> None:
-    """
-    Enable Per-Monitor v2 DPI awareness if available; fallback to system DPI aware.
-    """
+    """Enable Per-Monitor v2 DPI awareness if available; fallback to system DPI aware."""
     try:
         # -4 is DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -88,24 +114,20 @@ def set_dpi_awareness() -> None:
 # ===========================
 # Utilities (Rects & Capture)
 # ===========================
+
 def _get_system_metric(index: int) -> int:
-    """
-    Wrapper for user32.GetSystemMetrics.
-    """
+    """Wrapper for user32.GetSystemMetrics."""
     return ctypes.windll.user32.GetSystemMetrics(index)
 
 
 def _clamp_to_virtual_screen(
     left: int, top: int, right: int, bottom: int
 ) -> Tuple[int, int, int, int]:
-    """
-    Clamp a rect to the virtual screen to avoid negative or out-of-bounds values.
-    """
+    """Clamp a rect to the virtual screen to avoid negative or out-of-bounds values."""
     sm_x = _get_system_metric(win32con.SM_XVIRTUALSCREEN)
     sm_y = _get_system_metric(win32con.SM_YVIRTUALSCREEN)
     sm_w = _get_system_metric(win32con.SM_CXVIRTUALSCREEN)
     sm_h = _get_system_metric(win32con.SM_CYVIRTUALSCREEN)
-
     x1 = max(left, sm_x)
     y1 = max(top, sm_y)
     x2 = min(right, sm_x + sm_w)
@@ -138,7 +160,7 @@ def _get_frame_bounds_rect(hwnd: int) -> Tuple[int, int, int, int]:
             ctypes.sizeof(rect),
         )
         if res == 0:
-                       return rect.left, rect.top, rect.right, rect.bottom
+            return rect.left, rect.top, rect.right, rect.bottom
     except Exception:
         pass
 
@@ -150,12 +172,10 @@ def _get_frame_bounds_rect(hwnd: int) -> Tuple[int, int, int, int]:
 def get_foreground_rect(mode: str = RECT_MODE) -> Tuple[int, int, int, int]:
     """
     Get the rectangle of the current foreground window in screen coordinates.
-
     Modes:
-        - "client": client area via GetClientRect + ClientToScreen
-        - "frame" : extended frame bounds via DwmGetWindowAttribute
-        - "window": GetWindowRect
-
+      - "client": client area via GetClientRect + ClientToScreen
+      - "frame" : extended frame bounds via DwmGetWindowAttribute
+      - "window": GetWindowRect
     Rect is clamped to virtual screen.
     """
     hwnd = win32gui.GetForegroundWindow()
@@ -176,10 +196,8 @@ def get_foreground_rect(mode: str = RECT_MODE) -> Tuple[int, int, int, int]:
         raise ValueError(f"Unknown RECT_MODE: {mode}")
 
     left, top, right, bottom = _clamp_to_virtual_screen(left, top, right, bottom)
-
     if right - left < MIN_WINDOW_WIDTH or bottom - top < MIN_WINDOW_HEIGHT:
         raise RuntimeError(f"Rect too small: {(left, top, right, bottom)} (mode={mode})")
-
     return left, top, right, bottom
 
 
@@ -198,11 +216,11 @@ def capture_window_image(rect: Tuple[int, int, int, int]) -> np.ndarray:
 # ===========================
 # Diff & Polygons
 # ===========================
+
 def compute_diff_polygons(img_bgr: np.ndarray) -> List[np.ndarray]:
     """
     Split the image into left/right halves, compute absolute difference,
     threshold, clean noise, find contours, and approximate polygons.
-
     Returns a list of polygons (ndarray shape (N, 1, 2), dtype int32) in left-half coordinates.
     """
     h, w = img_bgr.shape[:2]
@@ -236,11 +254,16 @@ def compute_diff_polygons(img_bgr: np.ndarray) -> List[np.ndarray]:
 
 
 def make_overlay_image(
-    size: Tuple[int, int], polygons: List[np.ndarray], left_half_offset_x: int = 0
+    size: Tuple[int, int],
+    polygons: List[np.ndarray],
+    left_half_offset_x: int = 0,
+    border_color_bgr: Tuple[int, int, int] = (0, 255, 255),
+    fill: bool = DRAW_FILL,
 ) -> Image.Image:
     """
     Create a PIL Image with transparent background key and draw polygons.
     Polygons are in left-half coordinates; apply horizontal offset if needed.
+    Only border is drawn by default; set fill=True to also fill polygons (not recommended here).
     """
     w, h = size
     overlay_bgr = np.zeros((h, w, 3), dtype=np.uint8)
@@ -256,13 +279,16 @@ def make_overlay_image(
         poly_full = poly.copy()
         poly_full[:, 0, 0] = poly_full[:, 0, 0] + left_half_offset_x
 
-        cv2.fillPoly(overlay_bgr, [poly_full], POLYGON_FILL_COLOR_BGR)
+        if fill:
+            # Normally we do not fill for "skeleton/border-only" visualization.
+            cv2.fillPoly(overlay_bgr, [poly_full], color=border_color_bgr)
+
         cv2.polylines(
             overlay_bgr,
             [poly_full],
             isClosed=True,
-            color=POLYGON_BORDER_COLOR_BGR,
-            thickness=POLYGON_BORDER_THICKNESS,
+            color=border_color_bgr,
+            thickness=BORDER_THICKNESS,
         )
 
     overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
@@ -272,10 +298,13 @@ def make_overlay_image(
 # ===========================
 # Tk Windows
 # ===========================
+
 class OverlayWindow:
     """
     A topmost, borderless Toplevel aligned to the target rect with a transparent color key.
+    Supports blinking by updating the image periodically.
     """
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.window: Optional[tk.Toplevel] = None
@@ -283,9 +312,18 @@ class OverlayWindow:
         self._photo: Optional[ImageTk.PhotoImage] = None
         self.visible: bool = False
 
+        # Animation state
+        self._animating: bool = False
+        self._tick_job: Optional[str] = None
+        self._frame_idx: int = 0
+        self._polygons: List[np.ndarray] = []
+        self._size: Tuple[int, int] = (1, 1)
+        self._rect: Tuple[int, int, int, int] = (0, 0, 1, 1)
+
     def _ensure_created(self) -> None:
         if self.window is not None:
             return
+
         self.window = tk.Toplevel(self.root)
         self.window.withdraw()
         self.window.attributes("-topmost", True)
@@ -293,11 +331,13 @@ class OverlayWindow:
         try:
             self.window.wm_attributes("-transparentcolor", TRANSPARENT_KEY_HEX)
         except tk.TclError:
+            # Fallback: semi-transparent whole window (colorkey not supported).
             self.window.attributes("-alpha", 0.8)
+
         self.label = tk.Label(self.window, bg=TRANSPARENT_KEY_HEX)
         self.label.pack(fill=tk.BOTH, expand=True)
 
-    def show(self, rect: Tuple[int, int, int, int], overlay_img: Image.Image) -> None:
+    def _apply_frame(self, rect: Tuple[int, int, int, int], overlay_img: Image.Image) -> None:
         self._ensure_created()
         left, top, right, bottom = rect
         w = max(1, right - left)
@@ -305,12 +345,83 @@ class OverlayWindow:
 
         self.window.geometry(f"{w}x{h}+{left}+{top}")
         self._photo = ImageTk.PhotoImage(overlay_img)
+
         assert self.label is not None
         self.label.configure(image=self._photo)
         self.window.deiconify()
         self.visible = True
 
+    def _next_color(self) -> Tuple[int, int, int]:
+        """Pick next border color based on BLINK_MODE and frame index."""
+        if BLINK_MODE == "off":
+            # Use first color from high-contrast set.
+            return BLINK_COLORS_BGR[0]
+
+        if BLINK_MODE == "rainbow":
+            palette = RAINBOW_COLORS_BGR
+        else:
+            palette = BLINK_COLORS_BGR
+
+        if not palette:
+            # Safety: fallback to yellow if palette is empty.
+            return (0, 255, 255)
+
+        return palette[self._frame_idx % len(palette)]
+
+    def _tick(self) -> None:
+        """Render one frame and schedule the next if animating."""
+        if not self._animating:
+            return
+
+        border_color = self._next_color()
+        overlay_img = make_overlay_image(
+            size=self._size,
+            polygons=self._polygons,
+            left_half_offset_x=0,
+            border_color_bgr=border_color,
+            fill=DRAW_FILL,
+        )
+        self._apply_frame(self._rect, overlay_img)
+
+        self._frame_idx += 1
+        if BLINK_MODE != "off":
+            # Schedule next frame
+            self._tick_job = self.root.after(BLINK_INTERVAL_MS, self._tick)
+
+    def start_animation(
+        self,
+        rect: Tuple[int, int, int, int],
+        size: Tuple[int, int],
+        polygons: List[np.ndarray],
+    ) -> None:
+        """Start (or restart) blinking animation with given geometry and polygons."""
+        self._ensure_created()
+
+        # Cancel any pending job first
+        self.stop_animation()
+
+        self._rect = rect
+        self._size = size
+        self._polygons = polygons
+        self._frame_idx = 0
+        self._animating = True
+
+        # Draw first frame immediately
+        self._tick()
+
+    def stop_animation(self) -> None:
+        """Stop blinking and cancel scheduled jobs."""
+        self._animating = False
+        if self._tick_job is not None:
+            try:
+                self.root.after_cancel(self._tick_job)
+            except Exception:
+                pass
+            self._tick_job = None
+
     def clear(self) -> None:
+        """Clear the overlay (also stops animation)."""
+        self.stop_animation()
         if self.window is None or self.label is None:
             self.visible = False
             return
@@ -325,6 +436,7 @@ class DebugPreviewWindows:
     Two normal Toplevel windows to show left/right captured halves for debugging.
     Lazily created and guarded to avoid TclError.
     """
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.left_win: Optional[tk.Toplevel] = None
@@ -358,12 +470,13 @@ class DebugPreviewWindows:
     def update_images(self, left_img_bgr: np.ndarray, right_img_bgr: np.ndarray) -> None:
         if not self.visible:
             return
+
         self._ensure_created()
+
         assert self.left_label is not None and self.right_label is not None
 
         left_rgb = cv2.cvtColor(left_img_bgr, cv2.COLOR_BGR2RGB)
         right_rgb = cv2.cvtColor(right_img_bgr, cv2.COLOR_BGR2RGB)
-
         left_pil = Image.fromarray(left_rgb)
         right_pil = Image.fromarray(right_rgb)
 
@@ -392,10 +505,12 @@ class DebugPreviewWindows:
 # ===========================
 # Coordinator
 # ===========================
+
 class DiffHighlighterApp:
     """
     Coordinates hotkeys, window capture, diff computation, overlay display, and debug previews.
     """
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.overlay = OverlayWindow(root)
@@ -408,7 +523,7 @@ class DiffHighlighterApp:
 
     def toggle_overlay(self) -> None:
         """
-        Hotkey handler: if overlay visible -> clear; else capture and show.
+        Hotkey handler: if overlay visible -> clear; else capture and show (with blinking).
         """
         with self._lock:
             if self.overlay.visible:
@@ -425,22 +540,21 @@ class DiffHighlighterApp:
                 self.last_left_img_bgr = img_bgr[:, :mid]
                 self.last_right_img_bgr = img_bgr[:, w - mid:]
 
-                # Compute polygons and compose overlay
+                # Compute polygons and start animated overlay
                 polys = compute_diff_polygons(img_bgr)
-                overlay_img = make_overlay_image((w, h), polys, left_half_offset_x=0)
-
-                # Show overlay aligned to window
-                self._schedule(self.overlay.show, rect, overlay_img)
+                self._schedule(self.overlay.start_animation, rect, (w, h), polys)
 
                 # If debug is visible, update immediately
-                if self.debug_views.visible and \
-                        self.last_left_img_bgr is not None and self.last_right_img_bgr is not None:
+                if (
+                    self.debug_views.visible
+                    and self.last_left_img_bgr is not None
+                    and self.last_right_img_bgr is not None
+                ):
                     self._schedule(
                         self.debug_views.update_images,
                         self.last_left_img_bgr,
                         self.last_right_img_bgr,
                     )
-
             except Exception as exc:
                 print(f"[ERROR] toggle_overlay failed: {exc}", file=sys.stderr)
 
@@ -462,9 +576,7 @@ class DiffHighlighterApp:
                     )
 
     def quit_app(self) -> None:
-        """
-        Hotkey handler: quit application.
-        """
+        """Hotkey handler: quit application."""
         with self._lock:
             def _quit():
                 try:
@@ -476,16 +588,12 @@ class DiffHighlighterApp:
             self._schedule(_quit)
 
     def _schedule(self, func, *args, **kwargs) -> None:
-        """
-        Schedule UI updates on Tk main thread using after(0, ...).
-        """
+        """Schedule UI updates on Tk main thread using after(0, ...)."""
         self.root.after(0, lambda: func(*args, **kwargs))
 
 
 def start_hotkeys(app: DiffHighlighterApp):
-    """
-    Register global hotkeys. Runs on a background thread.
-    """
+    """Register global hotkeys. Runs on a background thread."""
     hotkeys = keyboard.GlobalHotKeys({
         HOTKEY_TOGGLE_OVERLAY: app.toggle_overlay,
         HOTKEY_DEBUG_TOGGLE: app.toggle_debug,
@@ -503,9 +611,9 @@ def start_hotkeys(app: DiffHighlighterApp):
 # ===========================
 # Main Entry
 # ===========================
+
 def main() -> None:
     set_dpi_awareness()
-
     root = tk.Tk()
     root.withdraw()  # We do not show the root; only Toplevels are used.
 
